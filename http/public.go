@@ -71,7 +71,15 @@ var withHashFile = func(fn handleFunc) handleFunc {
 		// the filesystem is now rebased onto basePath, so paths handed to the
 		// rule checker are relative to it. Resolve them back to the user's
 		// original scope so deny rules below the share root keep applying.
-		d.checkerPrefix = basePath
+		// When the share is rooted exactly at the user's scope, the rebased
+		// filesystem is identical to the original one: leave the prefix
+		// empty, otherwise the checker would join a root/current-dir prefix
+		// onto already scope-relative paths and rules would fail to match.
+		if basePath == "/" || basePath == "." {
+			d.checkerPrefix = ""
+		} else {
+			d.checkerPrefix = basePath
+		}
 
 		file, err = files.NewFileInfo(&files.FileOptions{
 			Fs:      d.user.Fs,

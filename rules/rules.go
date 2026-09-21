@@ -11,6 +11,35 @@ type Checker interface {
 	Check(path string) bool
 }
 
+// Match describes a single rule hit recorded during Evaluate. It carries
+// enough context for callers to log or audit how a decision was reached.
+type Match struct {
+	// Layer is the index of the layer the rule belongs to, following the
+	// order in which the layers were passed to Evaluate.
+	Layer int
+	// Rule is the rule that matched the path.
+	Rule *Rule
+}
+
+// Evaluate resolves the allow decision for path using a layered,
+// last-match-wins policy. Layers are passed from the lowest to the highest
+// priority: within a layer the last matching rule wins, and a layer with at
+// least one match overrides every lower-priority layer. When no rule
+// matches at all, the default decision is allow. Every rule hit is
+// returned in evaluation order so callers can trace the decision.
+func Evaluate(path string, layers ...[]Rule) (allow bool, matches []Match) {
+	allow = true
+	for layer, rules := range layers {
+		for i := range rules {
+			if rules[i].Matches(path) {
+				allow = rules[i].Allow
+				matches = append(matches, Match{Layer: layer, Rule: &rules[i]})
+			}
+		}
+	}
+	return allow, matches
+}
+
 // Rule is a allow/disallow rule.
 type Rule struct {
 	Regex  bool    `json:"regex"`
