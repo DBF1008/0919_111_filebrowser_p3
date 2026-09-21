@@ -43,6 +43,52 @@ func (r *Rule) Matches(path string) bool {
 	return strings.HasPrefix(path, prefix)
 }
 
+// Layer is a named, prioritized group of rules. Layers are evaluated in
+// the order they are passed to Evaluate: the first layer containing a
+// matching rule decides the outcome, so layers listed earlier have
+// strictly higher priority than later ones. Within a single layer the
+// last matching rule wins.
+type Layer struct {
+	Name  string
+	Rules []Rule
+}
+
+// Decision describes the outcome of evaluating a path against layered
+// rule sets.
+type Decision struct {
+	Allow   bool   // Allow is the final verdict.
+	Matched bool   // Matched reports whether any rule matched the path.
+	Layer   string // Layer is the name of the layer that decided the outcome.
+	Rule    *Rule  // Rule is the rule that decided the outcome (nil when none matched).
+}
+
+// Evaluate resolves the allow verdict for path against the given layers,
+// in descending priority order. When no rule in any layer matches, the
+// default is to allow.
+func Evaluate(path string, layers ...Layer) Decision {
+	for i := range layers {
+		layer := &layers[i]
+
+		var matched *Rule
+		for j := range layer.Rules {
+			if layer.Rules[j].Matches(path) {
+				matched = &layer.Rules[j]
+			}
+		}
+
+		if matched != nil {
+			return Decision{
+				Allow:   matched.Allow,
+				Matched: true,
+				Layer:   layer.Name,
+				Rule:    matched,
+			}
+		}
+	}
+
+	return Decision{Allow: true}
+}
+
 // Regexp is a wrapper to the native regexp type where we
 // save the raw expression.
 type Regexp struct {

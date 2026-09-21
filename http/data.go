@@ -3,8 +3,10 @@ package fbhttp
 import (
 	"log"
 	"net/http"
+	"os"
 	gopath "path"
 	"strconv"
+	"strings"
 
 	"github.com/tomasen/realip"
 
@@ -33,34 +35,83 @@ type data struct {
 	checkerPrefix string
 }
 
+// Rule layer names, in descending priority order. Global (administrator)
+// rules form the highest-priority layer, so a global deny can never be
+// overridden by a user's own rules.
+const (
+	ruleLayerGlobal = "global"
+	ruleLayerUser   = "user"
+)
+
+// rulesDebug enables debug-level logging of rule evaluation. It is
+// enabled by setting the FILEBROWSER_RULES_DEBUG environment variable,
+// which allows troubleshooting permission issues in production without
+// rebuilding.
+var rulesDebug = os.Getenv("FILEBROWSER_RULES_DEBUG") != ""
+
+func rulesDebugf(format string, args ...interface{}) {
+	if !rulesDebug {
+		return
+	}
+	log.Printf("DEBUG: rules: "+format, args...)
+}
+
 // Check implements rules.Checker.
 func (d *data) Check(path string) bool {
-	// When the filesystem has been rebased (e.g. a public share rooted at a
-	// subdirectory), the incoming path is relative to that root. Resolve it
-	// back to the user's original scope before matching rules, otherwise rules
-	// targeting paths below the share root would be silently bypassed.
-	if d.checkerPrefix != "" {
-		path = gopath.Join(d.checkerPrefix, path)
-	}
+	path = d.resolveCheckPath(path)
 
 	if d.user.HideDotfiles && rules.MatchHidden(path) {
+		rulesDebugf("path=%q is a hidden dotfile -> allow=false", path)
 		return false
 	}
 
-	allow := true
-	for _, rule := range d.settings.Rules {
-		if rule.Matches(path) {
-			allow = rule.Allow
-		}
+	decision := rules.Evaluate(path,
+		rules.Layer{Name: ruleLayerGlobal, Rules: d.settings.Rules},
+		rules.Layer{Name: ruleLayerUser, Rules: d.user.Rules},
+	)
+
+	if decision.Matched {
+		rulesDebugf("path=%q matched rule %q in %q layer -> allow=%t",
+			path, decision.Rule.Path, decision.Layer, decision.Allow)
+	} else {
+		rulesDebugf("path=%q matched no rule -> allow=%t (default)", path, decision.Allow)
 	}
 
-	for _, rule := range d.user.Rules {
-		if rule.Matches(path) {
-			allow = rule.Allow
-		}
+	return decision.Allow
+}
+
+// resolveCheckPath maps a path that is relative to a rebased filesystem
+// root (see checkerPrefix) back to the user's original scope, so that
+// rules — which are relative to the scope — keep matching.
+func (d *data) resolveCheckPath(path string) string {
+	prefix := d.checkerPrefix
+	if prefix == "" || prefix == "/" || prefix == "." {
+		// No rebasing in effect, or the filesystem was rebased onto the
+		// scope root itself (e.g. a share of the user's whole scope): the
+		// path is already relative to the scope.
+		return path
 	}
 
-	return allow
+	// Never prepend the prefix twice: a path that already starts with the
+	// prefix is already scope-relative.
+	if path == prefix || strings.HasPrefix(path, prefix+"/") {
+		return path
+	}
+
+	return gopath.Join(prefix, path)
+}
+
+// checkerPrefixForBase normalizes a share base path into a checker
+// prefix. When the share root is the user's scope root itself (the base
+// path cleans to "/" or "."), no prefix is needed: checked paths are
+// already relative to the scope, and prefixing them would duplicate the
+// scope root and break rule matching.
+func checkerPrefixForBase(basePath string) string {
+	cleaned := gopath.Clean(basePath)
+	if cleaned == "/" || cleaned == "." {
+		return ""
+	}
+	return cleaned
 }
 
 func handle(fn handleFunc, prefix string, store *storage.Storage, server *settings.Server) http.Handler {

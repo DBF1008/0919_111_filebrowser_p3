@@ -266,6 +266,182 @@ func newHTTPRequest(t *testing.T, requestModifiers ...func(*http.Request)) *http
 	return r
 }
 
+// TestPublicShareHandlerRootShareRules ensures that rules keep applying when
+// the shared path is exactly the user's scope root (share path "/"). In that
+// case the checker prefix must normalize to empty instead of being joined
+// onto already scope-relative paths, which would break rule matching.
+func TestPublicShareHandlerRootShareRules(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[string]struct {
+		handler            handleFunc
+		path               string
+		expectedStatusCode int
+	}{
+		"blocked file via dl handler, 403": {
+			handler:            publicDlHandler,
+			path:               "h/private/secret.txt",
+			expectedStatusCode: 403,
+		},
+		"blocked dir listing via share handler, 403": {
+			handler:            publicShareHandler,
+			path:               "h/private/",
+			expectedStatusCode: 403,
+		},
+		"allowed file via dl handler, 200": {
+			handler:            publicDlHandler,
+			path:               "h/public/readme.txt",
+			expectedStatusCode: 200,
+		},
+		"allowed dir listing via share handler, 200": {
+			handler:            publicShareHandler,
+			path:               "h/public/",
+			expectedStatusCode: 200,
+		},
+	}
+
+	for name, tc := range testCases {
+		name, tc := name, tc
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			dbPath := filepath.Join(t.TempDir(), "db")
+			db, err := storm.Open(dbPath)
+			if err != nil {
+				t.Fatalf("failed to open db: %v", err)
+			}
+			t.Cleanup(func() {
+				if err := db.Close(); err != nil {
+					t.Errorf("failed to close db: %v", err)
+				}
+			})
+
+			storage, err := bolt.NewStorage(db)
+			if err != nil {
+				t.Fatalf("failed to get storage: %v", err)
+			}
+			// The share path is exactly the user's scope root.
+			if err := storage.Share.Save(&share.Link{Hash: "h", UserID: 1, Path: "/"}); err != nil {
+				t.Fatalf("failed to save share: %v", err)
+			}
+			if err := storage.Users.Save(&users.User{
+				Username: "username",
+				Password: "pw",
+				Perm:     users.Permissions{Share: true, Download: true},
+				Rules: []rules.Rule{
+					{Allow: false, Path: "/private"},
+				},
+			}); err != nil {
+				t.Fatalf("failed to save user: %v", err)
+			}
+			if err := storage.Settings.Save(&settings.Settings{Key: []byte("key")}); err != nil {
+				t.Fatalf("failed to save settings: %v", err)
+			}
+
+			fs := afero.NewBasePathFs(afero.NewOsFs(), t.TempDir())
+			if err := fs.MkdirAll("/private", 0o755); err != nil {
+				t.Fatalf("failed to create private dir: %v", err)
+			}
+			if err := fs.MkdirAll("/public", 0o755); err != nil {
+				t.Fatalf("failed to create public dir: %v", err)
+			}
+			if err := afero.WriteFile(fs, "/private/secret.txt", []byte("top secret"), 0o600); err != nil {
+				t.Fatalf("failed to write secret file: %v", err)
+			}
+			if err := afero.WriteFile(fs, "/public/readme.txt", []byte("hello"), 0o600); err != nil {
+				t.Fatalf("failed to write public file: %v", err)
+			}
+
+			storage.Users = &customFSUser{
+				Store: storage.Users,
+				fs:    fs,
+			}
+
+			req := newHTTPRequest(t, func(r *http.Request) { r.URL.Path = tc.path })
+
+			recorder := httptest.NewRecorder()
+			handler := handle(tc.handler, "", storage, &settings.Server{})
+
+			handler.ServeHTTP(recorder, req)
+			result := recorder.Result()
+			defer result.Body.Close()
+			if result.StatusCode != tc.expectedStatusCode {
+				t.Errorf("expected status code %d, got status code %d", tc.expectedStatusCode, result.StatusCode)
+			}
+		})
+	}
+}
+
+// TestPublicShareHandlerGlobalRulePriority ensures an administrator's global
+// deny rule cannot be overridden by the share owner's own allow rule when
+// accessing files through a public share.
+func TestPublicShareHandlerGlobalRulePriority(t *testing.T) {
+	t.Parallel()
+
+	dbPath := filepath.Join(t.TempDir(), "db")
+	db, err := storm.Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("failed to close db: %v", err)
+		}
+	})
+
+	storage, err := bolt.NewStorage(db)
+	if err != nil {
+		t.Fatalf("failed to get storage: %v", err)
+	}
+	if err := storage.Share.Save(&share.Link{Hash: "h", UserID: 1, Path: "/projects"}); err != nil {
+		t.Fatalf("failed to save share: %v", err)
+	}
+	if err := storage.Users.Save(&users.User{
+		Username: "username",
+		Password: "pw",
+		Perm:     users.Permissions{Share: true, Download: true},
+		Rules: []rules.Rule{
+			// The owner explicitly allows the path the admin denied.
+			{Allow: true, Path: "/projects/private"},
+		},
+	}); err != nil {
+		t.Fatalf("failed to save user: %v", err)
+	}
+	if err := storage.Settings.Save(&settings.Settings{
+		Key: []byte("key"),
+		Rules: []rules.Rule{
+			{Allow: false, Path: "/projects/private"},
+		},
+	}); err != nil {
+		t.Fatalf("failed to save settings: %v", err)
+	}
+
+	fs := afero.NewBasePathFs(afero.NewOsFs(), t.TempDir())
+	if err := fs.MkdirAll("/projects/private", 0o755); err != nil {
+		t.Fatalf("failed to create private dir: %v", err)
+	}
+	if err := afero.WriteFile(fs, "/projects/private/secret.txt", []byte("top secret"), 0o600); err != nil {
+		t.Fatalf("failed to write secret file: %v", err)
+	}
+
+	storage.Users = &customFSUser{
+		Store: storage.Users,
+		fs:    fs,
+	}
+
+	req := newHTTPRequest(t, func(r *http.Request) { r.URL.Path = "h/private/secret.txt" })
+
+	recorder := httptest.NewRecorder()
+	handler := handle(publicDlHandler, "", storage, &settings.Server{})
+
+	handler.ServeHTTP(recorder, req)
+	result := recorder.Result()
+	defer result.Body.Close()
+	if result.StatusCode != 403 {
+		t.Errorf("expected status code 403, got status code %d", result.StatusCode)
+	}
+}
+
 type customFSUser struct {
 	users.Store
 	fs afero.Fs
